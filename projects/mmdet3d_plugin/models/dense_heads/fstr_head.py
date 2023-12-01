@@ -1,45 +1,28 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from distutils.command.build import build
-import enum
-from turtle import down
 import math
 import copy
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from mmcv.cnn import ConvModule, build_conv_layer
-from mmcv.cnn.bricks.transformer import FFN, build_positional_encoding
+from mmcv.cnn import build_conv_layer
 from mmcv.runner import BaseModule, force_fp32
-from mmcv.cnn import xavier_init, constant_init, kaiming_init
-from mmdet.core import (bbox_cxcywh_to_xyxy, bbox_xyxy_to_cxcywh,
-                        build_assigner, build_sampler, multi_apply,
+from mmdet.core import (build_assigner, build_sampler, multi_apply,
                         reduce_mean, build_bbox_coder)
 from mmdet.models.utils import build_transformer
 from mmdet.models import HEADS, build_loss
-from mmdet.models.utils import NormedLinear
-from mmdet.models.dense_heads.anchor_free_head import AnchorFreeHead
 from mmdet.models.utils.transformer import inverse_sigmoid
 from mmdet3d.models.utils.clip_sigmoid import clip_sigmoid
 from mmdet3d.models import builder
-from mmdet3d.core import (circle_nms, draw_heatmap_gaussian, gaussian_radius,
-                          xywhr2xyxyr)
 from einops import rearrange
 import collections
-from torch.cuda.amp.autocast_mode import autocast
 
 from functools import reduce
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
-from mmcv.cnn import Linear, bias_init_with_prob, Scale
-from mmdet.core import bbox_overlaps
-from mmdet3d.models.builder import build_head
-from mmdet3d.ops import SparseBasicBlock, make_sparse_convmodule
+from mmdet3d.ops import  make_sparse_convmodule
 import spconv.pytorch as spconv
-from mmcv.cnn import build_conv_layer, build_norm_layer
+from mmcv.cnn import build_conv_layer
 import copy
-# from mmdet3d.ops.spconv import SparseConvTensor
 from spconv.core import ConvAlgo
-from spconv.pytorch.pool import SparseMaxPool
+
 def pos2embed(pos, num_pos_feats=128, temperature=10000):
     scale = 2 * math.pi
     pos = pos * scale
@@ -54,17 +37,159 @@ def pos2embed(pos, num_pos_feats=128, temperature=10000):
     posemb = torch.cat((pos_y, pos_x), dim=-1)
     return posemb
 
-# def pos2embed(pos, num_pos_feats=128, temperature=10000):
-#     scale = 2 * math.pi
-#     pos = pos * scale
-#     dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos.device)
-#     dim_t = 2 * (dim_t // 2) / num_pos_feats + 1
-#     pos_x = pos[..., 0, None] / dim_t
-#     pos_y = pos[..., 1, None] / dim_t
-#     pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
-#     pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
-#     posemb = torch.cat((pos_y, pos_x), dim=-1)
-#     return posemb
+
+class LayerNormFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, groups, eps):
+        ctx.groups = groups
+        ctx.eps = eps
+        N, C, L = x.size()
+        x = x.view(N, groups, C // groups, L)
+        mu = x.mean(2, keepdim=True)
+        var = (x - mu).pow(2).mean(2, keepdim=True)
+        y = (x - mu) / (var + eps).sqrt()
+        ctx.save_for_backward(y, var, weight)
+        y = weight.view(1, C, 1) * y.view(N, C, L) + bias.view(1, C, 1)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        groups = ctx.groups
+        eps = ctx.eps
+
+        N, C, L = grad_output.size()
+        y, var, weight = ctx.saved_variables
+        g = grad_output * weight.view(1, C, 1)
+        g = g.view(N, groups, C//groups, L)
+        mean_g = g.mean(dim=2, keepdim=True)
+        mean_gy = (g * y).mean(dim=2, keepdim=True)
+        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
+        return gx.view(N, C, L), (grad_output * y.view(N, C, L)).sum(dim=2).sum(dim=0), grad_output.sum(dim=2).sum(
+            dim=0), None, None
+
+
+class GroupLayerNorm1d(nn.Module):
+
+    def __init__(self, channels, groups=1, eps=1e-6):
+        super(GroupLayerNorm1d, self).__init__()
+        self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
+        self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
+        self.groups = groups
+        self.eps = eps
+
+    def forward(self, x):
+        return LayerNormFunction.apply(x, self.weight, self.bias, self.groups, self.eps)
+
+
+@HEADS.register_module()
+class SeparateTaskHead(BaseModule):
+    """SeparateHead for CenterHead.
+
+    Args:
+        in_channels (int): Input channels for conv_layer.
+        heads (dict): Conv information.
+        head_conv (int): Output channels.
+            Default: 64.
+        final_kernal (int): Kernal size for the last conv layer.
+            Deafult: 1.
+        init_bias (float): Initial bias. Default: -2.19.
+        conv_cfg (dict): Config of conv layer.
+            Default: dict(type='Conv2d')
+        norm_cfg (dict): Config of norm layer.
+            Default: dict(type='BN2d').
+        bias (str): Type of bias. Default: 'auto'.
+    """
+
+    def __init__(self,
+                 in_channels,
+                 heads,
+                 groups=1,
+                 head_conv=64,
+                 final_kernel=1,
+                 init_bias=-2.19,
+                 init_cfg=None,
+                 **kwargs):
+        assert init_cfg is None, 'To prevent abnormal initialization ' \
+            'behavior, init_cfg is not allowed to be set'
+        super(SeparateTaskHead, self).__init__(init_cfg=init_cfg)
+        self.heads = heads
+        self.groups = groups
+        self.init_bias = init_bias
+        for head in self.heads:
+            classes, num_conv = self.heads[head]
+
+            conv_layers = []
+            c_in = in_channels
+            for i in range(num_conv - 1):
+                conv_layers.extend([
+                    nn.Conv1d(
+                        c_in * groups,
+                        head_conv * groups,
+                        kernel_size=final_kernel,
+                        stride=1,
+                        padding=final_kernel // 2,
+                        groups=groups,
+                        bias=False),
+                    GroupLayerNorm1d(head_conv * groups, groups=groups),
+                    nn.ReLU(inplace=True)
+                ])
+                c_in = head_conv
+
+            conv_layers.append(
+                nn.Conv1d(
+                    head_conv * groups,
+                    classes * groups,
+                    kernel_size=final_kernel,
+                    stride=1,
+                    padding=final_kernel // 2,
+                    groups=groups,
+                    bias=True))
+            conv_layers = nn.Sequential(*conv_layers)
+
+            self.__setattr__(head, conv_layers)
+
+            if init_cfg is None:
+                self.init_cfg = dict(type='Kaiming', layer='Conv1d')
+
+    def init_weights(self):
+        """Initialize weights."""
+        super().init_weights()
+        for head in self.heads:
+            if head == 'cls_logits':
+                self.__getattr__(head)[-1].bias.data.fill_(self.init_bias)
+
+    def forward(self, x):
+        """Forward function for SepHead.
+
+        Args:
+            x (torch.Tensor): Input feature map with the shape of
+                [N, B, query, C].
+
+        Returns:
+            dict[str: torch.Tensor]: contains the following keys:
+
+                -reg （torch.Tensor): 2D regression value with the \
+                    shape of [N, B, query, 2].
+                -height (torch.Tensor): Height value with the \
+                    shape of [N, B, query, 1].
+                -dim (torch.Tensor): Size value with the shape \
+                    of [N, B, query, 3].
+                -rot (torch.Tensor): Rotation value with the \
+                    shape of [N, B, query, 2].
+                -vel (torch.Tensor): Velocity value with the \
+                    shape of [N, B, query, 2].
+        """
+        N, B, query_num, c1 = x.shape
+        x = rearrange(x, "n b q c -> b (n c) q")
+        ret_dict = dict()
+        
+        for head in self.heads:
+             head_output = self.__getattr__(head)(x)
+             ret_dict[head] = rearrange(head_output, "b (n c) q -> n b q c", n=N)
+
+        return ret_dict
+
 
 
 @HEADS.register_module()
@@ -86,6 +211,13 @@ class FSTRHead(BaseModule):
                 split=0.75,
                 depth_num=64,
                 nms_kernel_size=3,
+                init_dn_query=False,
+                init_learnable_query = False,
+                init_query_topk = 1,
+                init_query_radius = 1,
+                gauusian_dn_sampling=False,
+                noise_mean = 0.5,
+                noise_std = 0.125,
                 train_cfg=None,
                 test_cfg=None,
                 common_heads=dict(
@@ -146,6 +278,13 @@ class FSTRHead(BaseModule):
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.pc_range = self.bbox_coder.pc_range
         self.fp16_enabled = False
+        self.init_dn_query = init_dn_query
+        self.init_learnable_query = init_learnable_query
+        self.gauusian_dn_sampling = gauusian_dn_sampling
+        self.noise_mean = noise_mean
+        self.noise_std = noise_std
+        self.init_query_topk = init_query_topk
+        self.init_query_radius = init_query_radius
 
         # transformer
         self.transformer = build_transformer(transformer)
@@ -219,7 +358,7 @@ class FSTRHead(BaseModule):
                         padding=0,
                         bias=True))
         
-        # fc_list.append(spconv.SubMConv2d(self.hidden_dim, output_channels, 1, bias=True, indice_key='hm_out'))
+        
         self.sparse_hm_layer = nn.Sequential(*fc_list)
         self.sparse_hm_layer[-1].bias.data.fill_(-2.19)
 
@@ -240,7 +379,7 @@ class FSTRHead(BaseModule):
     def init_weights(self):
         super(FSTRHead, self).init_weights()
         nn.init.uniform_(self.reference_points.weight.data, 0, 1)
-        # self.register_buffer("gaussian_B", torch.empty((3, self.hidden_dim)).normal_())
+        
     def _bev_query_embed(self, ref_points, img_metas):
         bev_embeds = self.bev_embedding(pos2embed(ref_points, num_pos_feats=self.hidden_dim))
         return bev_embeds
@@ -259,12 +398,11 @@ class FSTRHead(BaseModule):
         ret_dicts = []
         batch_size = len(img_metas)
         x = self.shared_conv(x)
-        x_feature = torch.zeros(*(x.features.shape)).to(x.features.device)
+        x_feature = torch.zeros(*(x.features.shape),device = x.features.device)
         x_feature[:,:] = x.features
-        x_batch_indices = torch.zeros(x.indices.shape[0],1).to(x.features.device)
-        x_ind = torch.zeros(x.indices.shape[0],2).to(x.features.device)
-        x_2dpos = torch.zeros(x.indices.shape[0],2).to(x.features.device)
-
+        x_batch_indices = torch.zeros(x.indices.shape[0],1,device = x.features.device)
+        x_ind = torch.zeros(x.indices.shape[0],2,device = x.features.device)
+        x_2dpos = torch.zeros(x.indices.shape[0],2,device = x.features.device)
         x_batch_indices[:,:] = x.indices[:,:1]
         x_ind[:,:] = x.indices[:,-2:]
         x_ind = x_ind.to(torch.float32)
@@ -305,8 +443,7 @@ class FSTRHead(BaseModule):
             proposal_feature.append(sample_voxel_feature.gather(0, proposal_ind.repeat(1,sample_voxel_feature.shape[1]))[None,...])
         query_pos = torch.cat(proposal_list,dim=0)
         query_init_feature = torch.cat(proposal_feature,dim=0)
-        # a = [init_reference_points.squeeze(0).detach().cpu().numpy(), self.pc_range]
-        # np.save('/home/zhangdiankun/nuscenes_val_sparse_localmax_proposal_1.npy',a)
+
         reference_points = self.reference_points.weight
         reference_points = reference_points.unsqueeze(0).repeat(batch_size,1,1)
 
@@ -317,9 +454,8 @@ class FSTRHead(BaseModule):
         reference_points, attn_mask, mask_dict = self.prepare_for_dn(batch_size, reference_points, img_metas)
         
         pad_size = mask_dict['pad_size'] if mask_dict is not None else 0
-        target = torch.zeros([*reference_points.shape[:2], self.hidden_dim]).to(reference_points.device)
-        target[:,pad_size:pad_size+self.num_init_query,:] = query_init_feature # [bs,num_query,c]
-        target = target.permute(1,0,2)
+        
+        target = self.get_sparse_init_query(reference_points, x_feature , x_2dpos, x_batch_indices, pad_size)
         
         bev_pos_embeds = self.bev_embedding(pos2embed(x_2dpos, num_pos_feats=self.hidden_dim))
         
@@ -329,12 +465,9 @@ class FSTRHead(BaseModule):
 
         # pad or drop 
 
-        batch_feature = torch.zeros(batch_size,self.max_sparse_token_per_sample,self.hidden_dim).to(x.features.device)
-        batch_bevemb = torch.zeros(batch_size,self.max_sparse_token_per_sample,self.hidden_dim).to(x.features.device)
-        # TODO shuffle feature and corresponding bev embedding
+        batch_feature = torch.zeros(batch_size,self.max_sparse_token_per_sample,self.hidden_dim,device = x.features.device)
+        batch_bevemb = torch.zeros(batch_size,self.max_sparse_token_per_sample,self.hidden_dim,device = x.features.device)
 
-        #
-        acc_idx = 0
         for i in range(batch_size):
             sample_token_num = (x_batch_indices==i).sum()
             batch_token_num = min(sample_token_num,self.max_sparse_token_per_sample)
@@ -347,7 +480,6 @@ class FSTRHead(BaseModule):
             batch_feature[i][:batch_token_num] = sample_voxel_feature.gather(0, voxel_ind.repeat(1,sample_voxel_feature.shape[1]))
             batch_bevemb[i][:batch_token_num] = sample_voxel_bev_emb.gather(0, voxel_ind.repeat(1,sample_voxel_bev_emb.shape[1]))
 
-        # target = self.get_bev_feature_from_ref_points(dense_hm, reference_points)
         outs_dec, _ = self.transformer(
                             batch_feature, query_embeds,
                             batch_bevemb,
@@ -403,6 +535,45 @@ class FSTRHead(BaseModule):
             ret_dicts.append(outs)
         ret_dicts[0]['sparse_heatmap'] = sparse_hm
         return ret_dicts
+    
+    
+    def get_sparse_init_query(self, ref_points, x_feature, x_2dpos , x_batch_indices, pad_size):
+
+        total_range = self.pc_range[3]-self.pc_range[0]
+        radius = self.init_query_radius
+        diameter = (2 * radius + 1)/total_range
+        sigma = diameter / 6
+        # masked_gaussian = torch.exp(- distances / (2 * sigma * sigma))
+        query_feature_list = []
+        batch_size = ref_points.shape[0]
+
+        for bs in range(batch_size):
+            sample_q = ref_points[bs][:,:2]
+            sample_mask = x_batch_indices[:,0] == bs
+            sample_token = x_feature[sample_mask]
+            sample_pos = x_2dpos[sample_mask]
+            with torch.no_grad():
+                dis_mat = sample_q.unsqueeze(1) - sample_pos.unsqueeze(0)
+                dis_mat = -(dis_mat ** 2).sum(-1)
+                nearest_dis_topk,nearest_order_topk = dis_mat.topk(self.init_query_topk ,dim=1,sorted= True)
+                gaussian_weight = torch.exp( nearest_dis_topk / (2 * sigma * sigma))
+                gaussian_weight_sum = torch.clip(gaussian_weight.sum(-1),1)
+            
+            flatten_order = nearest_order_topk.view(-1,self.init_query_topk)
+            flatten_weight = (gaussian_weight/gaussian_weight_sum.unsqueeze(1)).view(-1,self.init_query_topk)
+            feature = (sample_token.gather(0, flatten_order.repeat(1,sample_token.shape[1]))*flatten_weight).view(-1,self.init_query_topk,sample_token.shape[1]).sum(1).unsqueeze(0)
+            query_feature_list.append(feature)
+        
+        query_feature = torch.cat(query_feature_list,dim=0)
+        if not self.init_dn_query:
+           query_feature[:,:pad_size,:] *=0 
+        if not self.init_learnable_query:
+           query_feature[:,pad_size+self.num_init_query:,:] *=0  
+        query_feature = query_feature.permute(1,0,2)
+
+
+        return query_feature
+    
 
     def prepare_for_dn(self, batch_size, reference_points, img_metas):
         if self.training:
@@ -433,7 +604,14 @@ class FSTRHead(BaseModule):
             # known_query_cat_encoding = self.class_encoding(known_one_hot.float().unsqueeze(0))
             if self.bbox_noise_scale > 0:
                 diff = known_bbox_scale / 2 + self.bbox_noise_trans
-                rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
+                if self.gauusian_dn_sampling:
+                    rand_prob = torch.randn_like(known_bbox_center)*self.noise_std + self.noise_mean
+                    rand_pn = torch.rand_like(known_bbox_center)
+                    p_mask = rand_pn>0.5
+                    n_mask = rand_pn<=0.5
+                    rand_prob[n_mask] *= -1
+                else:
+                    rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
                 known_bbox_center += torch.mul(rand_prob, diff) * self.bbox_noise_scale
                 known_bbox_center[..., 0:1] = (known_bbox_center[..., 0:1] - self.pc_range[0]) / (
                     self.pc_range[3] - self.pc_range[0]

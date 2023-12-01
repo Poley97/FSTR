@@ -5,24 +5,15 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 # ------------------------------------------------------------------------
 
-import mmcv
-import copy
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
-from mmcv.runner import force_fp32, auto_fp16
-from mmdet.core import multi_apply
+from mmcv.runner import force_fp32
 from mmdet.models import DETECTORS
-from mmdet.models.builder import build_backbone
-from mmdet3d.core import (Box3DMode, Coord3DMode, bbox3d2result,
-                          merge_aug_bboxes_3d, show_result)
+from mmdet3d.core import bbox3d2result
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 
-from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from projects.mmdet3d_plugin import SPConvVoxelization
-
 
 @DETECTORS.register_module()
 class FSTRDetector(MVXTwoStageDetector):
@@ -51,18 +42,11 @@ class FSTRDetector(MVXTwoStageDetector):
             return None
         if pts is None:
             return None
-        # begin_time = time.time()
         voxels, num_points, coors = self.voxelize(pts)
         voxel_features = self.pts_voxel_encoder(voxels, num_points, coors,
                                                 )
-        # end_time = time.time()
-        # print('Voxelization time: ', (end_time - begin_time)*1000, " ms")
         batch_size = coors[-1, 0] + 1
-
-        # begin_time = time.time()
         x = self.pts_middle_encoder(voxel_features, coors, batch_size)
-        # end_time = time.time()
-        # print('VoxelNext time: ', (end_time - begin_time)*1000, " ms")
         return x
 
     @torch.no_grad()
@@ -127,14 +111,20 @@ class FSTRDetector(MVXTwoStageDetector):
         Returns:
             dict: Losses of different branches.
         """
+        # nvtx.range_push('forward')
+        # nvtx.range_push('voxel_backbone')
         pts_feats = self.extract_feat(
             points=points, img_metas=img_metas)
+        # nvtx.range_pop()
+        # nvtx.range_push('fstr_head')
         losses = dict()
         if pts_feats :
             losses_pts = self.forward_pts_train(pts_feats, gt_bboxes_3d,
                                                 gt_labels_3d, img_metas,
                                                 gt_bboxes_ignore)
             losses.update(losses_pts)
+        # nvtx.range_pop()
+        # nvtx.range_pop()
         return losses
 
     @force_fp32(apply_to=('pts_feats'))
@@ -215,20 +205,12 @@ class FSTRDetector(MVXTwoStageDetector):
     def simple_test(self, points, img_metas, rescale=False):
         """Test function without augmentaiton."""
 
-        # begin_time = time.time()
         pts_feats = self.extract_feat(
             points, img_metas=img_metas)
-        # backbone_time = time.time()
-        # print("backbone time: " , (backbone_time-begin_time)*1000," ms" )
         bbox_list = [dict() for i in range(len(img_metas))]
         if self.with_pts_bbox:
-            # begin_time = time.time()
             bbox_pts = self.simple_test_pts(
                 pts_feats, img_metas, rescale=rescale)
-            # head_time = time.time()
-            # print("sparse head time: ", head_time-begin_time)
             for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
                 result_dict['pts_bbox'] = pts_bbox
-        # end_time = time.time()
-        # print("total time: " , end_time-begin_time)
         return bbox_list

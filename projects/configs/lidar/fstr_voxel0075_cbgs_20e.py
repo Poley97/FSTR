@@ -186,6 +186,13 @@ model = dict(
         downsample_scale=8,
         num_query=500,
         num_init_query=200,
+        init_dn_query = False,
+        init_learnable_query = False,
+        init_query_topk = 1,
+        init_query_radius = 1,
+        gauusian_dn_sampling=False,
+        noise_mean = 0.5,
+        noise_std = 0.125,
         max_sparse_token_per_sample = 10000,
         common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
         tasks=[

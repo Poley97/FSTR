@@ -1,11 +1,6 @@
-from .cmt_head import (
-    SeparateTaskHead,
-    CmtHead,
-    CmtImageHead,
-    CmtLidarHead
-)
 from .fstr_head import (
-    FSTRHead
+    FSTRHead,
+    SeparateTaskHead,
 )
 
-__all__ = ['SeparateTaskHead', 'CmtHead', 'CmtLidarHead', 'CmtImageHead', 'FSTRHead']
+__all__ = ['SeparateTaskHead', 'FSTRHead']
