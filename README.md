@@ -54,7 +54,6 @@ Results on nuScenes **test set**. To reproduce our result, replace `ann_file=dat
 | [FSTR-Large](./projects/configs/lidar/fstr_large_voxel0075_cbgs_20e.py) + TTA | 69.5% | 73.0%  | 15e+5e | - |
 | [FSTR-XLarge](./projects/configs/lidar/fstr_xlarge_voxel0050_cbgs_20e.py) + TTA | 70.2% | 73.5%  | 15e+5e | - |
 
-Note that [FSTR-XLarge](./projects/configs/lidar/fstr_xlarge_voxel0050_cbgs_20e.py) are trained on a 8 Tesla A100 GPUs.
 ## Citation
 If you find our FSTR helpful in your research, please consider citing: 
 ```bibtex   
