@@ -47,8 +47,8 @@ Results on nuScenes **val set**. The default batch size is 2 on each GPU. The FP
 
 Results on nuScenes **test set**. To reproduce our result, replace `ann_file=data_root + '/nuscenes_infos_train.pkl'` in [training config](./projects/configs/lidar/fstr_large_voxel0075_cbgs_20e.py) with `ann_file=[data_root + '/nuscenes_infos_train.pkl', data_root + '/nuscenes_infos_val.pkl']`:
 
-| Config            |Modality| mAP      | NDS     | Schedule|Inference FPS|
-|:--------:|:----------:|:---------:|:--------:|:--------:|:--------:|
+| Config            | mAP      | NDS     | Schedule|Inference FPS|
+|:--------:|:----------:|:---------:|:--------:|:--------:|
 | [FSTR](./projects/configs/lidar/fstr_voxel0075_cbgs_20e.py) | 66.2% | 70.4%  | 15e+5e | 15.4 |
 | [FSTR](./projects/configs/lidar/fstr_voxel0075_cbgs_20e.py) +TTA | 67.6% | 71.5%  | 15e+5e | - |
 | [FSTR-Large](./projects/configs/lidar/fstr_large_voxel0075_cbgs_20e.py) + TTA | 69.5% | 73.0%  | 15e+5e | - |
